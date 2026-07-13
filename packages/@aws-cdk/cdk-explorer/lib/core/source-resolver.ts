@@ -25,6 +25,8 @@ export class SourceMapResolver {
   // Parsed source maps keyed by absolute .js path; null = known to have no map.
   private readonly cache = new Map<string, TraceMap | null>();
   private readonly collectedWarnings: string[] = [];
+  // Java source roots (e.g. src/main/java), discovered lazily once per resolver.
+  private javaSourceRootsCache?: string[];
 
   /**
    * @param projectRoot - Absolute path to the project the assembly belongs to.
@@ -50,17 +52,26 @@ export class SourceMapResolver {
     if (!frames) return undefined;
 
     // First in-root, supported-source frame wins. Host-language traces carry
-    // framework .js frames (outside the root) ahead of the user's .py
+    // framework .js frames (outside the root) ahead of the user's .py/.java
     // frame, so skip past them rather than stop at the first parsed frame.
     for (const frame of frames) {
       const parsed = parseFrame(frame);
       if (!parsed) continue;
       const kind = sourceKind(parsed.file);
       if (!kind) continue;
+      // Java sends only the bare source filename (StackTraceElement.getFileName())
+      // with no path; rebuild it from the FQN before the in-root check below.
+      if (kind === 'host' && parsed.file.endsWith('.java') && path.basename(parsed.file) === parsed.file) {
+        const resolved = await this.resolveJavaSource(parsed);
+        if (!resolved) continue;
+        return normalizeHostFrame({ ...parsed, file: resolved });
+      }
       // The frame's file path is assembly-derived and attacker-influenceable.
       // Never read or surface a location outside the project.
       if (!(await isWithinRoot(this.projectRoot, parsed.file))) continue;
-      return kind === 'host' ? normalizeHostFrame(parsed) : this.mapJsToOriginalSource(parsed);
+      // Hand off only the location fields; `name` exists solely for Java rebuild.
+      const loc: SourceLocation = { file: parsed.file, line: parsed.line, column: parsed.column };
+      return kind === 'host' ? normalizeHostFrame(loc) : this.mapJsToOriginalSource(loc);
     }
     return undefined;
   }
@@ -89,6 +100,61 @@ export class SourceMapResolver {
     // mapped original within the project, else fall back to the (in-root) .js.
     if (!(await isWithinRoot(this.projectRoot, file))) return loc;
     return { file, line: orig.line, column: orig.column + 1 };
+  }
+
+  /**
+   * Rebuild a Java source path the JVM never provides at runtime. A Java frame
+   * carries only a bare filename (StackTraceElement.getFileName()) plus the
+   * fully-qualified class+method as its name. The package is that name minus its
+   * class and method segments; joined with the filename under a Java source root
+   * it gives the on-disk path. Returns undefined when no in-root root has it.
+   */
+  private async resolveJavaSource(loc: ParsedFrame): Promise<string | undefined> {
+    const segments = loc.name.split('.');
+    if (segments.length < 2) return undefined; // need at least Class.method
+    const packageSegments = segments.slice(0, -2); // drop class + method; [] = default package
+    // The FQN is assembly-derived; its segments must be plain identifiers, never
+    // empty or a traversal/separator, before they are turned into a path.
+    if (packageSegments.some((s) => s === '' || s === '.' || s === '..' || s.includes('/') || s.includes(path.sep))) {
+      return undefined;
+    }
+    const rel = path.join(...packageSegments, loc.file);
+    for (const root of await this.javaSourceRoots()) {
+      const candidate = path.join(root, rel);
+      // Contain before any filesystem touch, so a crafted path is never stat'd.
+      if (!(await isWithinRoot(this.projectRoot, candidate))) continue;
+      try {
+        await fs.promises.access(candidate);
+        return candidate;
+      } catch {
+        // not under this root; try the next
+      }
+    }
+    return undefined;
+  }
+
+  /** Maven/Gradle `src/main/java` roots at the project root and one module level. */
+  private async javaSourceRoots(): Promise<string[]> {
+    if (this.javaSourceRootsCache) return this.javaSourceRootsCache;
+    const roots: string[] = [];
+    const probe = async (base: string) => {
+      const dir = path.join(base, 'src', 'main', 'java');
+      try {
+        if ((await fs.promises.stat(dir)).isDirectory()) roots.push(dir);
+      } catch {
+        // no source root here
+      }
+    };
+    await probe(this.projectRoot);
+    try {
+      for (const entry of await fs.promises.readdir(this.projectRoot, { withFileTypes: true })) {
+        if (entry.isDirectory()) await probe(path.join(this.projectRoot, entry.name));
+      }
+    } catch {
+      // project root unreadable; use whatever we found
+    }
+    this.javaSourceRootsCache = roots;
+    return roots;
   }
 
   private async loadTraceMap(jsFile: string): Promise<TraceMap | null> {
@@ -142,7 +208,7 @@ export class SourceMapResolver {
 // TypeScript/JavaScript frames go through source-map resolution (.js -> .ts).
 const TS_JS_EXTENSIONS = ['.ts', '.tsx', '.js'] as const;
 // jsii host-language frames already point at user source (no source map needed).
-const HOST_LANGUAGE_EXTENSIONS = ['.py'] as const;
+const HOST_LANGUAGE_EXTENSIONS = ['.py', '.java'] as const;
 
 function sourceKind(file: string): 'tsjs' | 'host' | undefined {
   if (TS_JS_EXTENSIONS.some((ext) => file.endsWith(ext))) return 'tsjs';
@@ -159,14 +225,22 @@ function normalizeHostFrame(loc: SourceLocation): SourceLocation {
 // unavailable, so it's optional. Anchoring on "(" avoids a leading "at ".
 const FRAME_RE = /\(([^()\s][^()]*?):(\d+)(?::(\d+))?\)\s*$/;
 
-function parseFrame(frame: string): SourceLocation | undefined {
+// A parsed frame plus its name (text before "("). For a Java frame the name is
+// the fully-qualified class + method, which carries the package the bare
+// filename lacks.
+interface ParsedFrame extends SourceLocation {
+  readonly name: string;
+}
+
+function parseFrame(frame: string): ParsedFrame | undefined {
   const m = FRAME_RE.exec(frame);
   if (!m) return undefined;
   const line = Number(m[2]);
   // Host frames may omit the column; treat absent as 0 (unavailable).
   const column = m[3] !== undefined ? Number(m[3]) : 0;
   if (!Number.isFinite(line) || !Number.isFinite(column)) return undefined;
-  return { file: m[1], line, column };
+  const name = frame.slice(0, m.index).trim().split(/\s+/).pop() ?? '';
+  return { file: m[1], line, column, name };
 }
 
 /**

@@ -107,6 +107,31 @@ describe('SourceMapResolver.resolveFrames', () => {
   test('drops a host frame whose file escapes the project root', async () => {
     expect(await resolver.resolveFrames(['<module> (/etc/evil.py:1)'])).toBeUndefined();
   });
+
+  test('reconstructs a Java host frame from its FQN under a source root', async () => {
+    const root = tmpDir();
+    const dir = path.join(root, 'src', 'main', 'java', 'com', 'test', 'cdkapp');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'ApiStack.java'), 'package com.test.cdkapp;\n');
+    // jsii sends a bare filename; the package comes from the FQN in the frame name.
+    expect(await new SourceMapResolver(root).resolveFrames(['com.test.cdkapp.ApiStack.<init> (ApiStack.java:42)'])).toEqual({
+      file: path.join(dir, 'ApiStack.java'), line: 42, column: 1,
+    });
+  });
+
+  test('reconstructs a Java inner-class frame to its outer file', async () => {
+    const root = tmpDir();
+    const dir = path.join(root, 'src', 'main', 'java', 'com', 'test', 'cdkapp');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'ApiStack.java'), 'package com.test.cdkapp;\n');
+    expect(await new SourceMapResolver(root).resolveFrames(['com.test.cdkapp.ApiStack$Builder.build (ApiStack.java:50)'])).toEqual({
+      file: path.join(dir, 'ApiStack.java'), line: 50, column: 1,
+    });
+  });
+
+  test('drops a Java host frame when no source root contains the file', async () => {
+    expect(await new SourceMapResolver(tmpDir()).resolveFrames(['com.test.cdkapp.Missing.<init> (Missing.java:5)'])).toBeUndefined();
+  });
 });
 
 describe('source-map resolution', () => {
